@@ -1,0 +1,104 @@
+# ──── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+
+# ──── Node / Frontend ───────────────────────────────────────────
+node_modules/
+dist/
+build/
+.vite/
+.parcel-cache/
+.next/
+.nuxt/
+*.local
+
+# ──── IDE / Editor ──────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ──── Secrets / Config (lokal) ─────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.json
+
+# ──── Logs / Runtime ───────────────────────────────────────────
+*.log
+logs/
+*.log.*
+runtime/
+.cache/
+tmp/
+temp/
+
+# ──── Pi-Agent-Daten (lokal pro User, nicht im Repo) ───────────
+# Das Backend liest Provider-Keys + Modelle aus ~/.pi/agent/ zur Laufzeit.
+# Diese Dateien enthalten sensible API-Keys und sind USER-SPEZIFISCH.
+# Daher werden sie hier explizit ausgeschlossen.
+.pi-agent-data/
+data/
+sessions/
+
+# ──── Tests / Coverage ─────────────────────────────────────────
+coverage/
+.nyc_output/
+junit.xml
+test-results/
+
+# ──── OS-spezifisch ────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# ──── Eigene Pi-Dashboard-spezifische Ausschluesse ─────────────
+# Test-Fixtures (lokale Review-Tests, nicht Teil der App)
+test_review*.json
+
+# Backend-Instanz-spezifische Caches
+backend/app/routers/__pycache__/
+backend/app/__pycache__/
+backend/.pytest_cache/
+
+# Build-Artefakte
+backend/build/
+backend/dist/
+backend/*.egg-info/
+
+# Frontend-Build
+frontend/dist/
+frontend/.vite/
+
+# Lock-Files (optional: package-lock.json kann rein, yarn.lock nicht wenn beides)
+# Hier lassen wir package-lock.json DRIN, weil es die Reproduzierbarkeit sicherstellt.
+
+# ──── nalabs/ ist ein separates Git-Repo (submodule-faehig) ─────
+# Bei Bedarf als Submodul einbinden: git submodule add <url> nalabs
+nalabs/
