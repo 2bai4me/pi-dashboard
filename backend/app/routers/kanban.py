@@ -147,6 +147,15 @@ class Task(BaseModel):
     updated_at: str = ""
     order: int = 0
     iteration_count: int = 0  # Wie oft wurde dieser Task iteriert
+    # Bug 3 Fix (Task d63824618a8c): Audit-Pflicht — optionales Feld fuer Frontend-Badge
+    # Wird gesetzt, wenn Task keine History hatte (Legacy-Migration) und rekonstruiert wurde.
+    # Pydantic v2 unterstuetzt keine Felder mit fuehrendem Underscore, daher `audit_warning`.
+    audit_warning: str | None = None
+    history: list[dict] = []  # History-Liste, im Pydantic-Modell optional mit Default
+    # UI-Redesign (Task d3dabcba252c): Phase-Tracking — wann ist der Task in den aktuellen Status gewechselt?
+    # Wird bei jedem Status-Wechsel via _set_task_status() aktualisiert. Bestehende Tasks
+    # bekommen das Feld per list_tasks-Migration auf created_at gesetzt.
+    phase_started_at: str | None = None
 
 
 class KpiMetric(BaseModel):
@@ -1388,7 +1397,8 @@ async def process_triage(project_id: str, _user: str = Depends(require_auth)) ->
     triage = [t for t in tasks if t.get("project_id") == project_id and t.get("status") == "triage"]
     processed = []
     for t in triage:
-        t["status"] = "todo"
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, "todo", agent="system", reason="process_triage")
         desc_len = len(t.get("description", ""))
         t["priority"] = 75 if desc_len > 500 else 50 if desc_len > 200 else 25
         t["assigned_role"] = "pi-coder"
@@ -1418,7 +1428,8 @@ async def review_task(task_id: str, _user: str = Depends(require_auth)) -> dict:
     t = next((t for t in tasks if t["id"] == task_id), None)
     if not t:
         raise HTTPException(404, "Task not found")
-    t["status"] = "review"
+    # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+    _set_task_status(t, "review", agent="pi-reviewer", reason="review_endpoint")
     t["updated_at"] = _now()
     t["review"] = {
         "review_model": "minimax-m3",
@@ -1458,6 +1469,158 @@ def _now():
 
 def _id():
     return uuid.uuid4().hex[:12]
+
+
+# === Bug 3 Fix (Task d63824618a8c): Audit-Pflicht fuer status=done ===
+# Diese Helper-Funktionen stellen sicher, dass jeder Status-Wechsel MIT
+# History-Eintrag erfolgt. Sie sind der einzige zulaessige Weg, den Task-Status
+# zu setzen — direkte `t['status'] = ...` Schreibvorgaenge sind ein Anti-Pattern
+# und fuehren zu Audit-Luecken.
+
+def _set_task_status(t: dict, new_status: str, agent: str = "system", reason: str = "", **extra) -> None:
+    """Setzt Task-Status MIT pflichtigem History-Eintrag (Bug 3 Fix).
+
+    Verhalten:
+    - Idempotent: Wenn old_status == new_status, KEIN Schreibvorgang + KEIN History-Eintrag
+    - Pflicht: JEDER Status-Wechsel schreibt einen status_changed History-Eintrag
+    - Spezielle Felder je nach Status: done_at, claimed_at, block_reason
+
+    Args:
+        t: Task-Dict (wird in-place mutiert)
+        new_status: Neuer Status (triage|todo|in_progress|review|block|done|blocked)
+        agent: Wer setzt den Status (pi-coder, kanban-operator, system, etc.)
+        reason: Optionaler Grund (z.B. fuer block-Status)
+        **extra: Weitere Details fuer den History-Eintrag
+    """
+    old_status = t.get("status")
+    if old_status == new_status:
+        return  # Idempotent: nichts tun wenn schon gleich
+    now = _now()
+    # UI-Redesign (Task d3dabcba252c): Phase-Tracking — Dauer der VORHERIGEN Phase
+    # berechnen und als phase_completed History-Eintrag festhalten. Wird sowohl
+    # fuer Frontend-Phase-Timer als auch fuer retrospektive Auswertungen genutzt.
+    old_phase_started = t.get("phase_started_at")
+    phase_duration_seconds: int | None = None
+    phase_duration_human: str | None = None
+    if old_phase_started:
+        try:
+            start_dt = datetime.fromisoformat(old_phase_started.replace("Z", "+00:00"))
+            now_dt = datetime.fromisoformat(now)
+            # Falls naive (kein tzinfo), als UTC interpretieren (sicherer Fallback)
+            if start_dt.tzinfo is not None and now_dt.tzinfo is None:
+                from datetime import timezone
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+            elif start_dt.tzinfo is None and now_dt.tzinfo is not None:
+                from datetime import timezone
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            phase_duration_seconds = max(0, int((now_dt - start_dt).total_seconds()))
+            # Human-readable: Xh Ymin / Ymin / Xs
+            h = phase_duration_seconds // 3600
+            m = (phase_duration_seconds % 3600) // 60
+            s = phase_duration_seconds % 60
+            if h > 0:
+                phase_duration_human = f"{h}h {m}min"
+            elif m > 0:
+                phase_duration_human = f"{m}min"
+            else:
+                phase_duration_human = f"{s}s"
+        except (ValueError, TypeError):
+            pass
+    t["status"] = new_status
+    t["updated_at"] = now
+    # UI-Redesign (Task d3dabcba252c): Phase-Start der NEUEN Phase setzen
+    t["phase_started_at"] = now
+    # Status-spezifische Felder
+    if new_status == "done":
+        t["done_at"] = now
+    elif new_status == "in_progress" and not t.get("claimed_at"):
+        t["claimed_at"] = now
+    elif new_status == "block" and reason:
+        t["block_reason"] = reason
+    # Pflicht: History-Eintrag (kwargs direkt an _add_history uebergeben,
+    # NICHT als 'details=...' wrapper, um Doppel-Verschachtelung zu vermeiden)
+    _add_history(
+        t, "status_changed", agent=agent,
+        **{"from": old_status, "to": new_status, "reason": reason, **extra},
+    )
+    # UI-Redesign (Task d3dabcba252c): Zusaetzlicher phase_completed History-Eintrag
+    # mit Dauer der vorherigen Phase. Wird vom Frontend fuer den Phase-Timer-Backfill
+    # genutzt, falls Task-Daten im Nachhinein geladen werden.
+    if phase_duration_seconds is not None and old_status is not None:
+        _add_history(
+            t, "phase_completed", agent=agent,
+            **{"from_status": old_status, "to_status": new_status,
+               "duration_seconds": phase_duration_seconds,
+               "duration_human": phase_duration_human},
+        )
+
+
+def _ensure_minimal_history(t: dict) -> None:
+    """Stellt sicher dass jeder Task mindestens 1 History-Eintrag hat (Bug 3 Fix).
+
+    Fuer Legacy-Tasks (z.B. SRS-Migration) ohne History wird ein
+    'history_reconstructed' Marker-Eintrag hinzugefuegt und ein
+    audit_warning gesetzt. Wird in list_tasks/get_task aufgerufen.
+    """
+    if not t.get("history"):
+        t["history"] = [{
+            "ts": t.get("updated_at", _now()),
+            "event": "history_reconstructed",
+            "agent": "system",
+            "details": {
+                "note": "Task hatte keine History. Rekonstruiert fuer Audit-Trail (Bug 3 Fix, Task d63824618a8c).",
+                "migrated_from": t.get("requirement_ref") or "unknown",
+            },
+        }]
+        # Audit-Warnung setzen (Frontend zeigt '⚠️ Audit-Warnung'-Badge)
+        t["audit_warning"] = "no_history_found"
+
+
+# === Bug 2 Fix (Task d63824618a8c): Haenger-Erkennung ===
+def _detect_haenger_tasks(tasks: list, now: datetime | None = None) -> list[dict]:
+    """Erkennt Haenger: in_progress ohne agent_pid ODER agent_pid tot (Bug 2 Fix).
+
+    Args:
+        tasks: Liste aller Task-Dicts
+        now: Optional datetime.now() Override (fuer Tests)
+
+    Returns:
+        Liste von Haenger-Tasks mit 'haenger_grund' + 'age_seconds' Annotations.
+    """
+    if now is None:
+        now = datetime.now()
+    haenger = []
+    for t in tasks:
+        if t.get("status") != "in_progress":
+            continue
+        # Alter pruefen (updated_at > 10 Min)
+        try:
+            updated_str = t.get("updated_at", "2000-01-01").replace("Z", "+00:00")
+            updated_dt = datetime.fromisoformat(updated_str)
+            # Falls naive (kein tzinfo), als UTC interpretieren
+            if updated_dt.tzinfo is None:
+                from datetime import timezone
+                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+            age = (now - updated_dt).total_seconds()
+        except (ValueError, TypeError):
+            continue
+        if age < HAENGER_AGE_SECONDS:
+            continue
+        # Check 1: kein agent_pid
+        if not t.get("agent_pid"):
+            haenger.append({**t, "haenger_grund": "no_agent_pid", "age_seconds": int(age)})
+            continue
+        # Check 2: agent_pid Prozess existiert nicht mehr
+        pid = t.get("agent_pid")
+        try:
+            os.kill(pid, 0)  # Signal 0 = nur pruefen, nicht killen
+        except (ProcessLookupError, PermissionError):
+            haenger.append({**t, "haenger_grund": "pid_dead", "age_seconds": int(age)})
+        except OSError:
+            # Andere OS-Errors (z.B. Windows): vorsichtig sein
+            haenger.append({**t, "haenger_grund": "pid_check_failed", "age_seconds": int(age)})
+    return haenger
 
 
 def _coerce_prio_int(value, default: int = 50) -> int:
@@ -2719,6 +2882,27 @@ async def list_tasks(project_id: str | None = None, _user: str = Depends(require
     # Initial-Migration: alle bestehenden Tasks ohne/mit String-Prio -> 0
     if _migrate_task_prio(all_tasks):
         _save_json(KANBAN_DIR / "tasks.json", all_tasks)
+    # Bug 3 Fix (Task d63824618a8c): Audit-Pflicht — alle Tasks bekommen mindestens
+    # 1 History-Eintrag (history_reconstructed fuer Legacy). Frontend zeigt
+    # `_audit_warning` als '⚠️ Audit-Warnung'-Badge.
+    audit_changed = False
+    for t in all_tasks:
+        if not t.get("history"):
+            _ensure_minimal_history(t)
+            audit_changed = True
+    if audit_changed:
+        _save_json(KANBAN_DIR / "tasks.json", all_tasks)
+    # UI-Redesign (Task d3dabcba252c): Phase-Tracking-Migration — bestehende Tasks
+    # ohne phase_started_at bekommen den Fallback created_at. Damit funktioniert
+    # der Phase-Timer auch fuer Legacy-Tasks korrekt (Annahme: Phase startete bei
+    # Task-Erstellung, was fuer die meisten realistisch ist).
+    phase_migration_changed = False
+    for t in all_tasks:
+        if not t.get("phase_started_at"):
+            t["phase_started_at"] = t.get("created_at") or t.get("updated_at") or _now()
+            phase_migration_changed = True
+    if phase_migration_changed:
+        _save_json(KANBAN_DIR / "tasks.json", all_tasks)
     if project_id:
         all_tasks = [t for t in all_tasks if t.get("project_id") == project_id]
     return [Task(**t) for t in all_tasks]
@@ -2755,6 +2939,10 @@ async def create_task(req: dict, _user: str = Depends(require_auth)) -> Task:
         created_at=_now(), updated_at=_now(),
         order=len(tasks),
         iteration_count=0,
+        # UI-Redesign (Task d3dabcba252c): Phase-Tracking — neue Tasks starten ihre
+        # Phase direkt bei Erstellung. Bei spaeteren Status-Wechseln (z.B. auto_claim)
+        # wird das Feld via _set_task_status() aktualisiert.
+        phase_started_at=_now(),
     )
     task_dict = t.model_dump()
     task_dict["history"] = []
@@ -3058,11 +3246,10 @@ def _kanban_operator_auto_claim(task: dict, now: str) -> dict:
     """Wenn Status auf 'todo' gesetzt wird, uebernimmt der PI-Worker automatisch (Triage->Todo->In Progress)."""
     if task.get("status") != "todo":
         return {"auto_action": None}
-    # PI-Worker uebernimmt
-    task["status"] = "in_progress"
+    # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+    _set_task_status(task, "in_progress", agent="kanban-operator", reason="auto_claim")
     task["claimed_at"] = now
     task["assigned_role"] = task.get("assigned_role") or "pi-coder"
-    task["updated_at"] = now
     # PREIS-SNAPSHOT: aktuellen Provider-Preis fixieren fuer spaetere Cost-Berechnung
     snap = _take_pricing_snapshot(task)
     return {
@@ -3088,8 +3275,8 @@ async def update_task_status(task_id: str, req: TaskStatusUpdate, _user: str = D
     if req.status not in valid_statuses:
         raise HTTPException(400, f"Ungueltiger Status. Erlaubt: {valid_statuses}")
     now = _now()
-    t["status"] = req.status
-    t["updated_at"] = now
+    # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+    _set_task_status(t, req.status, agent="user", reason="update_task_status")
     auto_log = None
     # Kanban-Operator: Auto-Claim wenn Status auf 'todo' gesetzt wird
     if req.status == "todo":
@@ -3115,7 +3302,8 @@ def _kanban_operator_emergency_watchdog(task: dict, now: str) -> dict:
     if task.get("status") in ("done",):
         return {"auto_action": None, "skipped": "task_already_done"}  # Erledigte Tasks nicht mehr starten
     previous_status = task.get("status", "?")
-    task["status"] = "in_progress"
+    # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+    _set_task_status(task, "in_progress", agent="kanban-operator", reason="emergency_watchdog: priority>=90")
     task["emergency"] = True
     task["emergency_at"] = now
     task["emergency_reason"] = "priority=100 (Watchdog-Auto-Claim)"
@@ -3123,7 +3311,6 @@ def _kanban_operator_emergency_watchdog(task: dict, now: str) -> dict:
     # assigned_role beibehalten falls schon gesetzt, sonst default
     if not task.get("assigned_role") or task.get("assigned_role") == "":
         task["assigned_role"] = "pi-coder"
-    task["updated_at"] = now
     # PREIS-SNAPSHOT: Notfall = aktueller Preis wird sofort fixiert
     snap = _take_pricing_snapshot(task)
     return {
@@ -3180,6 +3367,12 @@ async def update_dispatch_status(task_id: str, req: TaskDispatchUpdate, _user: s
 
     Wird vom swarm-spawner oder direkt vom Sub-Agent nach Process-Start aufgerufen,
     um Rolle, PID und Status zurueck ans Dashboard zu melden.
+
+    Bug 1 Fix (Task d63824618a8c): SYNC-BUG
+    ---------------------------------------
+    Wenn SubAgent `status=done` meldet, wird `task.status` automatisch auf `done` gesetzt
+    (statt nur `dispatch_status`). Analog fuer `status=dispatched` -> `task.status=in_progress`
+    falls Task noch in 'todo' war. Idempotent: Mehrfaches done erzeugt nur 1 History-Eintrag.
     """
     tasks = _load_json(KANBAN_DIR / "tasks.json")
     t = next((t for t in tasks if t["id"] == task_id), None)
@@ -3221,6 +3414,30 @@ async def update_dispatch_status(task_id: str, req: TaskDispatchUpdate, _user: s
             "pricing_snapshot_used": snap,  # Traceability: Welcher Preis wurde verwendet
         },
     })
+
+    # ─── SYNC-Bug 1 Fix: dispatch_status synchronisiert task.status ───
+    # Wenn SubAgent 'done' meldet, Task auf done setzen
+    # Wenn SubAgent 'dispatched' meldet und Task noch in 'todo' war, auf 'in_progress'
+    sync_status_changed = False
+    if req.status == "done" and t.get("status") != "done":
+        old_status = t["status"]
+        _set_task_status(
+            t, "done", agent=req.role or "subagent",
+            reason=f"SubAgent meldete done: {req.reason or 'kein Grund'}",
+            sync_from="dispatch",
+            dispatch_pid=req.agent_pid,
+        )
+        sync_status_changed = True
+    elif req.status == "dispatched" and t.get("status") == "todo":
+        # SubAgent hat uebernommen: todo -> in_progress
+        _set_task_status(
+            t, "in_progress", agent=req.role or "subagent",
+            reason="SubAgent hat Task uebernommen (dispatched)",
+            sync_from="dispatch",
+            dispatch_pid=req.agent_pid,
+        )
+        sync_status_changed = True
+
     _save_json(KANBAN_DIR / "tasks.json", tasks)
     # SSE-Event
     await _publish_task_event(t.get("project_id", ""), "task_dispatched", t)
@@ -3231,6 +3448,36 @@ async def update_dispatch_status(task_id: str, req: TaskDispatchUpdate, _user: s
         "dispatch_status": t.get("dispatch_status"),
         "dispatch_model": t.get("dispatch_model"),
         "agent_pid": t.get("agent_pid"),
+        "task_status_synced": sync_status_changed,  # Bug 1 Fix: zeigt an ob task.status geaendert wurde
+        "task_status": t.get("status"),
+    }
+
+
+# === Bug 2 Fix (Task d63824618a8c): Haenger-Erkennung als Endpoint ===
+@router.get("/haenger")
+async def list_haenger(_user: str = Depends(require_auth)) -> dict:
+    """Listet alle Haenger-Tasks (Bug 2 Fix).
+
+    Ein Task gilt als Haenger, wenn:
+    - status == 'in_progress'
+    - updated_at > 10 Min her
+    - UND (kein agent_pid ODER agent_pid Prozess existiert nicht mehr)
+
+    Returns:
+        { haenger: [...], count: N, checked_at: ISO-Timestamp }
+    """
+    tasks = _load_json(KANBAN_DIR / "tasks.json")
+    now = datetime.now()
+    haenger = _detect_haenger_tasks(tasks, now)
+    return {
+        "haenger": haenger,
+        "count": len(haenger),
+        "checked_at": now.isoformat(),
+        "thresholds": {
+            "age_seconds": HAENGER_AGE_SECONDS,
+            "worker_switch_age": HAENGER_WORKER_SWITCH_AGE,
+            "emergency_age": HAENGER_EMERGENCY_AGE,
+        },
     }
 
 
@@ -3370,8 +3617,8 @@ async def aggregate_subtask_status(task_id: str, _user: str = Depends(require_au
     elif any(s == "triage" for s in statuses):
         # Sub-Tasks muessen erst in Todo/InProgress sein
         pass
-    parent["status"] = new_status
-    parent["updated_at"] = _now()
+    # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+    _set_task_status(parent, new_status, agent="kanban-operator", reason="aggregate_subtask_status", subtask_statuses=statuses)
     _save_json(KANBAN_DIR / "tasks.json", tasks)
     return {
         "ok": True,
@@ -3458,10 +3705,10 @@ async def task_workflow_action(task_id: str, req: dict, _user: str = Depends(req
         # Triage -> Todo -> In Progress (PI-Worker uebernimmt)
         if t["status"] not in ("triage", "todo"):
             raise HTTPException(400, f"Task kann nicht 'claim' von Status '{t['status']}'")
-        t["status"] = "in_progress"
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, "in_progress", agent="pi-worker", reason="workflow:claim")
         t["claimed_at"] = now
         t["assigned_role"] = t.get("assigned_role") or "pi-coder"
-        t["updated_at"] = now
         result = {"action": "claim", "new_status": "in_progress", "message": f"PI-Worker hat Task uebernommen."}
     elif action == "submit_review":
         # In Progress -> Review (Auto-Review)
@@ -3470,16 +3717,15 @@ async def task_workflow_action(task_id: str, req: dict, _user: str = Depends(req
         review = _auto_review_task(t)
         t["last_review"] = {**review, "reviewed_at": now}
         if review["ok"]:
-            # OK -> Done
-            t["status"] = "done"
+            # OK -> Done (Bug 3 Fix: Status-Setter via Helper)
+            _set_task_status(t, "done", agent="pi-worker", reason="auto_review_ok", iteration=t.get("iteration_count", 0))
             t["completed_at"] = now
-            t["updated_at"] = now
             result = {"action": "submit_review", "new_status": "done", "review_ok": True, "message": "Auto-Review bestanden -> Done."}
         else:
             # Fail -> zurueck zu In Progress (Iteration++)
             t["iteration_count"] = t.get("iteration_count", 0) + 1
-            t["status"] = "in_progress"
-            t["updated_at"] = now
+            # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+            _set_task_status(t, "in_progress", agent="pi-worker", reason="auto_review_fail", issues=review.get("issue_counts", {}))
             result = {"action": "submit_review", "new_status": "in_progress", "review_ok": False, "message": f"Auto-Review fehlgeschlagen ({review['issue_counts']['high']} kritisch, {review['issue_counts']['medium']} mittel) -> Iteration {t['iteration_count']}."}
     elif action == "cio_approve":
         if t["status"] != "done":
@@ -3495,24 +3741,24 @@ async def task_workflow_action(task_id: str, req: dict, _user: str = Depends(req
         if target not in ("todo", "in_progress", "triage"):
             target = "todo"
         t["cio_approved"] = False
-        t["status"] = target
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, target, agent="cio", reason=f"cio_reject: {req.get('reason', 'kein Grund')}")
         t["cio_reject_reason"] = req.get("reason", "")
-        t["updated_at"] = now
         result = {"action": "cio_reject", "new_status": target, "message": f"CIO hat Task abgelehnt -> {target}."}
     elif action == "block":
         reason = req.get("reason", "Manuell blockiert")
-        t["status"] = "block"
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, "block", agent="user", reason=reason)
         t["block_reason"] = reason
-        t["updated_at"] = now
         result = {"action": "block", "new_status": "block", "message": f"Task blockiert: {reason}"}
     elif action == "tester_ok":
         # Review -> Block + auto-create CIO-Sub-Task (in Todo)
         if t["status"] != "review":
             raise HTTPException(400, f"Task muss 'review' sein fuer tester_ok, ist aber '{t['status']}'")
         previous_status = t["status"]
-        t["status"] = "block"
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, "block", agent="pi-tester", reason="tester_ok: review bestanden, warte auf CIO-Freigabe")
         t["tester_passed_at"] = now
-        t["updated_at"] = now
         # Auto-Create CIO-Sub-Task
         cio_sub = {
             "id": _id(),
@@ -3565,11 +3811,11 @@ async def task_workflow_action(task_id: str, req: dict, _user: str = Depends(req
         # Review -> In Progress (Fix-Loop)
         if t["status"] != "review":
             raise HTTPException(400, f"Task muss 'review' sein fuer tester_reject, ist aber '{t['status']}'")
-        t["status"] = "in_progress"
+        # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+        _set_task_status(t, "in_progress", agent="pi-tester", reason=f"tester_reject: {req.get('reason', 'Tester hat Issues gefunden')}")
         t["tester_rejected_at"] = now
         t["tester_reject_reason"] = req.get("reason", "Tester hat Issues gefunden")
         t["iteration_count"] = t.get("iteration_count", 0) + 1
-        t["updated_at"] = now
         result = {
             "action": "tester_reject",
             "new_status": "in_progress",
@@ -3632,8 +3878,8 @@ async def bulk_set_tasks_to_triage(project_id: str, _user: str = Depends(require
     count = 0
     for t in tasks:
         if t.get("project_id") == project_id:
-            t["status"] = "triage"
-            t["updated_at"] = _now()
+            # Bug 3 Fix: Status-Setter via Helper (Audit-Pflicht)
+            _set_task_status(t, "triage", agent="system", reason="bulk_set_tasks_to_triage")
             count += 1
     _save_json(KANBAN_DIR / "tasks.json", tasks)
     return {"ok": True, "project_id": project_id, "updated": count}

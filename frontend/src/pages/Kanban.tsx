@@ -99,6 +99,81 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+// === UI-Redesign (Task d3dabcba252c): Phase-Timer, Level + Kosten Helpers ===
+// Phase-Timer: Dauer der aktuellen Phase in Sekunden + human-readable String + Warn-Level
+//   ok     = < 1h        (normale Farbe)
+//   warn   = 1h..4h      (orange Warnung)
+//   danger = > 4h        (rot Haenger-Warnung)
+// Verwendet phase_started_at (Backend) als Quelle, mit graceful Fallback auf
+// updated_at / created_at falls das Feld noch fehlt (z.B. Legacy-Tasks).
+function getPhaseDuration(task: any): { seconds: number; human: string; warning: "ok" | "warn" | "danger"; tooltip: string } {
+  if (!task) return { seconds: 0, human: "—", warning: "ok", tooltip: "Kein Task" };
+  const startStr = task.phase_started_at || task.updated_at || task.created_at;
+  if (!startStr) return { seconds: 0, human: "—", warning: "ok", tooltip: "Kein Start-Zeitstempel" };
+  let start = 0;
+  try {
+    start = new Date(startStr).getTime();
+  } catch {
+    return { seconds: 0, human: "—", warning: "ok", tooltip: "Ungueltiger Zeitstempel" };
+  }
+  if (isNaN(start)) return { seconds: 0, human: "—", warning: "ok", tooltip: "Ungueltiger Zeitstempel" };
+  const now = Date.now();
+  const seconds = Math.max(0, Math.floor((now - start) / 1000));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  // Format: HH:MM bevorzugt (kompatibel mit Mockup), alternativ human-readable
+  const human = h > 0 ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}` : `${String(m).padStart(2, "0")}:00`;
+  const tooltip = h > 0
+    ? `In ${task.status} seit ${new Date(start).toLocaleString()} — vor ${h} Std ${m} Min`
+    : `In ${task.status} seit ${new Date(start).toLocaleString()} — vor ${m} Min`;
+  let warning: "ok" | "warn" | "danger" = "ok";
+  if (seconds > 14400) warning = "danger"; // > 4h
+  else if (seconds > 3600) warning = "warn"; // > 1h
+  return { seconds, human, warning, tooltip };
+}
+
+// Task-Level: berechnet die Hierarchie-Tiefe (1 = Top-Level, 2 = Sub-Task, 3+ = nested)
+//   Logik: 1 + (Anzahl Parent-Generationen) via rekursivem parent_id-Lookup
+//   Zyklus-Schutz ueber visited-Set (defensiv fuer kaputte Daten)
+function getTaskLevel(task: any, allTasks: any[]): number {
+  if (!task || !task.parent_id) return 1;
+  let level = 2;
+  let current: any = task;
+  const visited = new Set<string>();
+  visited.add(task.id);
+  while (current && current.parent_id) {
+    if (visited.has(current.parent_id)) break; // Zyklus-Schutz
+    visited.add(current.parent_id);
+    const parent = allTasks.find((t: any) => t.id === current.parent_id);
+    if (!parent) break;
+    level++;
+    current = parent;
+  }
+  return level;
+}
+
+// Kumulierte Kosten: aggregiert cost_usd / tokens_in / tokens_out ueber alle
+// History-Eintraege. Fallback auf task.stats.cost_usd fuer Modelle ohne
+// History-getrackte Kosten (z.B. Pricing-Snapshot).
+function getTotalCost(task: any): { usd: number; tokens_in: number; tokens_out: number; tooltip: string } {
+  if (!task) return { usd: 0, tokens_in: 0, tokens_out: 0, tooltip: "Kein Task" };
+  let usd = 0, tokens_in = 0, tokens_out = 0;
+  for (const h of task.history || []) {
+    usd += Number(h.cost_usd) || 0;
+    tokens_in += Number(h.tokens_in) || 0;
+    tokens_out += Number(h.tokens_out) || 0;
+  }
+  if (usd === 0 && task.stats?.cost_usd) usd = Number(task.stats.cost_usd) || 0;
+  // Format-String fuer Footer-Anzeige
+  let display: string;
+  if (usd === 0) display = "$0.00";
+  else if (usd < 0.01) display = `$${usd.toFixed(4)}`;
+  else if (usd < 1) display = `$${usd.toFixed(3)}`;
+  else display = `$${usd.toFixed(2)}`;
+  const tooltip = `Total: ${display} (${(tokens_in / 1000).toFixed(1)}K tokens in, ${(tokens_out / 1000).toFixed(1)}K out)`;
+  return { usd, tokens_in, tokens_out, tooltip: task.history?.length ? tooltip : "Keine History-Eintraege" };
+}
+
 // Highlighting: markiert alle Vorkommen der Suchbegriffe im Text (XSS-sicher)
 function highlight(text: string, query: string): { highlighted: string; matches: boolean } {
   const q = (query || "").trim();
@@ -1726,7 +1801,21 @@ export default function KanbanAdvanced() {
                   <span style={{ fontWeight: 600, fontSize: 13, textTransform: "uppercase" }}>{col.label}</span>
                   <span style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>{colTasks.length}</span>
                 </div>
-                {colTasks.map((task: any) => (
+                {colTasks.map((task: any) => {
+                  // UI-Redesign (Task d3dabcba252c): Phase-Timer, Level + Kosten
+                  const phase = getPhaseDuration(task);
+                  const level = getTaskLevel(task, allTasks || []);
+                  const cost = getTotalCost(task);
+                  const p = typeof task.priority === "number" ? task.priority : 0;
+                  const isEmergency = p === 100 || task.emergency;
+                  const prioInfo = isEmergency ? { bg: "var(--color-hermes-danger)", fg: "white" } : prioColor(p);
+                  // Phase-Timer Farbe (ok=normal, warn=orange, danger=rot)
+                  const phaseColor =
+                    phase.warning === "danger" ? "var(--color-hermes-danger)" :
+                    phase.warning === "warn" ? "var(--color-hermes-accent-orange)" :
+                    "var(--color-hermes-text-secondary)";
+                  const showPhase = task.status !== "done" && task.status !== "triage";
+                  return (
                   <div
                     key={task.id}
                     className="card"
@@ -1747,33 +1836,64 @@ export default function KanbanAdvanced() {
                       transition: "opacity 0.1s",
                     }}
                   >
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                    {/* HEADER (Zeile 1): Phase-Timer | IdBadge | Prio-Badge — alle gleiche Font-Groesse (12px monospace) */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                      {showPhase ? (
+                        <span
+                          title={phase.tooltip}
+                          style={{
+                            fontWeight: 600,
+                            color: phaseColor,
+                            minWidth: 42,
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
+                          ⏱ {phase.human}
+                        </span>
+                      ) : (
+                        <span style={{ minWidth: 42, color: "var(--color-hermes-text-secondary)", opacity: 0.4 }}>—</span>
+                      )}
                       <IdBadge id={task.id} variant="board" />
-                      <span style={{ fontWeight: 500, flex: 1 }}>{task.title}</span>
-                      {(() => {
-                        const p = typeof task.priority === "number" ? task.priority : 0;
-                        const isEmergency = p === 100 || task.emergency;
-                        const info = isEmergency ? { bg: "var(--color-hermes-danger)", fg: "white" } : prioColor(p);
-                        return (
-                          <span
-                            title={isEmergency ? "🚨 NOTFALL — Watchdog-Auto-Claim" : `Prio: ${p} (${prioColor(p).label})`}
-                            style={{
-                              fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3,
-                              background: info.bg, color: info.fg,
-                              animation: isEmergency ? "pulse-emergency 1.5s ease-in-out infinite" : undefined,
-                              boxShadow: isEmergency ? "0 0 6px rgba(248,81,73,0.5)" : undefined,
-                            }}
-                          >
-                            {isEmergency ? "🚨" : "🔥"} {p}
-                          </span>
-                        );
-                      })()}
+                      <span style={{ flex: 1 }} />
+                      <span
+                        title={isEmergency ? "🚨 NOTFALL — Watchdog-Auto-Claim" : `Prio: ${p} (${prioColor(p).label})`}
+                        style={{
+                          fontSize: 12, fontWeight: 700, padding: "1px 6px", borderRadius: 3,
+                          background: prioInfo.bg, color: prioInfo.fg,
+                          animation: isEmergency ? "pulse-emergency 1.5s ease-in-out infinite" : undefined,
+                          boxShadow: isEmergency ? "0 0 6px rgba(248,81,73,0.5)" : undefined,
+                        }}
+                      >
+                        {isEmergency ? "🚨" : "🔥"} {p}
+                      </span>
                     </div>
-                    <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>
-                      {ROLE_EMOJI[task.assigned_role] || "🤖"} {task.assigned_role}
-                      {!task.parent_id && <span className="badge badge-blue" style={{ fontSize: 9, marginLeft: 4 }}>Parent</span>}
-                      {task.parent_id && <span style={{ fontSize: 9, marginLeft: 4 }}>↳ child</span>}
-                      {task.emergency && <span style={{ fontSize: 9, color: "var(--color-hermes-danger)", fontWeight: 700, marginLeft: 4 }}>NOTFALL</span>}
+                    {/* BODY (Zeile 2): Title — volle Breite, fett, Truncation bei langen Texten */}
+                    <div
+                      title={task.title}
+                      style={{
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 4,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {task.title}
+                    </div>
+                    {/* FOOTER (Zeile 3): Role · Level X (Mitte) · $X.XXX (rechts) */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                        {ROLE_EMOJI[task.assigned_role] || "🤖"} {task.assigned_role}
+                      </span>
+                      <span style={{ opacity: 0.4 }}>·</span>
+                      <span title={`Hierarchie-Tiefe: ${level} (1=top-level)`} style={{ fontWeight: 500 }}>Level {level}</span>
+                      <span style={{ flex: 1 }} />
+                      {cost.usd > 0 && (
+                        <span title={cost.tooltip} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums", color: "var(--color-hermes-text-secondary)" }}>
+                          ${cost.usd < 0.01 ? cost.usd.toFixed(4) : cost.usd < 1 ? cost.usd.toFixed(3) : cost.usd.toFixed(2)}
+                        </span>
+                      )}
                     </div>
                     {task.success_criteria?.length > 0 && (
                       <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
@@ -1804,7 +1924,13 @@ export default function KanbanAdvanced() {
                       </button>
                     )}
                     {task.status === "in_progress" && (
-                      <button className="btn btn-primary" style={{ fontSize: 9, padding: "1px 6px", marginTop: 4 }} onClick={(e) => { e.stopPropagation(); workflowMut.mutate({ taskId: task.id, action: "submit_review" }); }} disabled={workflowMut.isPending}>
+                      <button
+                        className="btn btn-primary"
+                        style={{ fontSize: 9, padding: "1px 6px", marginTop: 4 }}
+                        onClick={(e) => { e.stopPropagation(); workflowMut.mutate({ taskId: task.id, action: "submit_review" }); }}
+                        disabled={workflowMut.isPending}
+                        title="Manuelle Bearbeitung: Klicken nach Code-Fertigstellung. Auto-Worker-Flow: SubAgent meldet done automatisch via /dispatch. Loest Auto-Review aus (statische Code-Analyse)."
+                      >
                         🔍 Submit Review
                       </button>
                     )}
@@ -1827,7 +1953,8 @@ export default function KanbanAdvanced() {
                       </button>
                     )}
                   </div>
-                ))}
+                  );
+                })}
                 {colTasks.length === 0 && (
                   <div style={{ padding: 16, textAlign: "center", color: "var(--color-hermes-text-secondary)", fontSize: 12, border: "1px dashed var(--color-hermes-border)", borderRadius: 6 }}>
                     {searchQuery.trim() ? `Keine Treffer in ${col.label}` : "Empty"}
@@ -1919,35 +2046,73 @@ export default function KanbanAdvanced() {
             // Bei Suche: automatisch expandiert
             const isExpanded = searchQuery.trim() ? true : expandedTasks.has(parent.id);
             const parentTitleHl = highlight(parent.title || "", searchQuery);
+            // UI-Redesign (Task d3dabcba252c): Phase-Timer, Level + Kosten (Parent-Card)
+            const parentPhase = getPhaseDuration(parent);
+            const parentLevel = getTaskLevel(parent, allTasks || []);
+            const parentCost = getTotalCost(parent);
+            const parentP = typeof parent.priority === "number" ? parent.priority : 0;
+            const parentIsEmergency = parentP === 100 || parent.emergency;
+            const parentPrioInfo = parentIsEmergency ? { bg: "var(--color-hermes-danger)", fg: "white" } : prioColor(parentP);
+            const parentPhaseColor =
+              parentPhase.warning === "danger" ? "var(--color-hermes-danger)" :
+              parentPhase.warning === "warn" ? "var(--color-hermes-accent-orange)" :
+              "var(--color-hermes-text-secondary)";
+            const showParentPhase = parent.status !== "done" && parent.status !== "triage";
             return (
               <div key={parent.id} className="card" style={{ marginBottom: 8, padding: "10px 14px" }}>
-                {/* Parent */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }} onClick={() => { toggleTask(parent.id); setSelectedTask(parent); }}>
-                  {allChildren.length > 0 ? (isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <div style={{ width: 14 }} />}
-                  <IdBadge id={parent.id} variant="board" />
-                  <span style={{ fontWeight: 600, fontSize: 14, flex: 1 }} dangerouslySetInnerHTML={{ __html: parentTitleHl.highlighted }} />
-                  {(() => {
-                    const p = typeof parent.priority === "number" ? parent.priority : 0;
-                    const isEmergency = p === 100 || parent.emergency;
-                    const info = isEmergency ? { bg: "var(--color-hermes-danger)", fg: "white" } : prioColor(p);
-                    return (
-                      <span
-                        title={isEmergency ? "🚨 NOTFALL — Watchdog-Auto-Claim" : `Prio: ${p} (${prioColor(p).label})`}
-                        style={{
-                          fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 3,
-                          background: info.bg, color: info.fg,
-                          animation: isEmergency ? "pulse-emergency 1.5s ease-in-out infinite" : undefined,
-                          boxShadow: isEmergency ? "0 0 6px rgba(248,81,73,0.5)" : undefined,
-                        }}
-                      >
-                        {isEmergency ? "🚨" : "🔥"} {p}
+                {/* Parent — 3-Zeilen Layout wie Board-Kacheln (UI-Redesign d3dabcba252c) */}
+                <div style={{ cursor: "pointer" }} onClick={() => { toggleTask(parent.id); setSelectedTask(parent); }}>
+                  {/* HEADER: Phase-Timer | IdBadge | Prio-Badge — gleiche Font-Groesse (12px monospace) */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                    {allChildren.length > 0 ? (isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />) : <span style={{ width: 12 }} />}
+                    {showParentPhase ? (
+                      <span title={parentPhase.tooltip} style={{ fontWeight: 600, color: parentPhaseColor, minWidth: 42, fontVariantNumeric: "tabular-nums" }}>
+                        ⏱ {parentPhase.human}
                       </span>
-                    );
-                  })()}
-                  <span className={`badge ${parent.status === "done" ? "badge-green" : parent.status === "in_progress" ? "badge-orange" : "badge-blue"}`}>{parent.status}</span>
-                  <span style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>{ROLE_EMOJI[parent.assigned_role] || "🤖"} {parent.assigned_role}</span>
-                  {parent.iteration_count > 0 && <span className="badge badge-orange" style={{ fontSize: 9 }}>{parent.iteration_count}x iterated</span>}
-                  {parent.emergency && <span style={{ fontSize: 9, color: "var(--color-hermes-danger)", fontWeight: 700 }}>🚨 NOTFALL</span>}
+                    ) : (
+                      <span style={{ minWidth: 42, color: "var(--color-hermes-text-secondary)", opacity: 0.4 }}>—</span>
+                    )}
+                    <IdBadge id={parent.id} variant="board" />
+                    <span style={{ flex: 1 }} />
+                    <span
+                      title={parentIsEmergency ? "🚨 NOTFALL — Watchdog-Auto-Claim" : `Prio: ${parentP} (${prioColor(parentP).label})`}
+                      style={{
+                        fontSize: 12, fontWeight: 700, padding: "1px 6px", borderRadius: 3,
+                        background: parentPrioInfo.bg, color: parentPrioInfo.fg,
+                        animation: parentIsEmergency ? "pulse-emergency 1.5s ease-in-out infinite" : undefined,
+                        boxShadow: parentIsEmergency ? "0 0 6px rgba(248,81,73,0.5)" : undefined,
+                      }}
+                    >
+                      {parentIsEmergency ? "🚨" : "🔥"} {parentP}
+                    </span>
+                  </div>
+                  {/* BODY: Title volle Breite, fett, Truncation */}
+                  <div
+                    title={parent.title}
+                    style={{
+                      fontWeight: 600,
+                      fontSize: 14,
+                      marginBottom: 4,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                    dangerouslySetInnerHTML={{ __html: parentTitleHl.highlighted }}
+                  />
+                  {/* FOOTER: Status-Badge · Role · Level · Kosten */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>
+                    <span className={`badge ${parent.status === "done" ? "badge-green" : parent.status === "in_progress" ? "badge-orange" : "badge-blue"}`} style={{ fontSize: 9 }}>{parent.status}</span>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>{ROLE_EMOJI[parent.assigned_role] || "🤖"} {parent.assigned_role}</span>
+                    <span style={{ opacity: 0.4 }}>·</span>
+                    <span title={`Hierarchie-Tiefe: ${parentLevel}`} style={{ fontWeight: 500 }}>Level {parentLevel}</span>
+                    {parent.iteration_count > 0 && <span className="badge badge-orange" style={{ fontSize: 9 }}>🔄 {parent.iteration_count}x</span>}
+                    <span style={{ flex: 1 }} />
+                    {parentCost.usd > 0 && (
+                      <span title={parentCost.tooltip} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
+                        ${parentCost.usd < 0.01 ? parentCost.usd.toFixed(4) : parentCost.usd < 1 ? parentCost.usd.toFixed(3) : parentCost.usd.toFixed(2)}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 {parent.success_criteria?.length > 0 && (
                   <div style={{ marginTop: 4, fontSize: 11, color: "var(--color-hermes-text-secondary)", paddingLeft: 22 }}>
@@ -1969,15 +2134,70 @@ export default function KanbanAdvanced() {
                     {children.map((child: any) => {
                       const childTitleHl = highlight(child.title || "", searchQuery);
                       const childIsMatch = searchQuery.trim() ? taskMatchesQuery(child, searchQuery) : false;
+                      // UI-Redesign (Task d3dabcba252c): Phase-Timer, Level + Kosten (Child-Card)
+                      const childPhase = getPhaseDuration(child);
+                      const childLevel = getTaskLevel(child, allTasks || []);
+                      const childCost = getTotalCost(child);
+                      const childP = typeof child.priority === "number" ? child.priority : 0;
+                      const childIsEmergency = childP === 100 || child.emergency;
+                      const childPrioInfo = childIsEmergency ? { bg: "var(--color-hermes-danger)", fg: "white" } : prioColor(childP);
+                      const childPhaseColor =
+                        childPhase.warning === "danger" ? "var(--color-hermes-danger)" :
+                        childPhase.warning === "warn" ? "var(--color-hermes-accent-orange)" :
+                        "var(--color-hermes-text-secondary)";
+                      const showChildPhase = child.status !== "done" && child.status !== "triage";
                       return (
                       <div key={child.id} style={{ padding: "6px 10px", background: childIsMatch ? "rgba(255,213,79,0.1)" : "var(--color-hermes-muted)", borderRadius: 6, borderLeft: childIsMatch ? "2px solid var(--color-hermes-accent-orange)" : "none" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        {/* HEADER: GitBranch + Phase-Timer | IdBadge | Prio-Badge (12px monospace) */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3, fontFamily: "var(--font-mono)", fontSize: 12 }}>
                           <GitBranch size={10} color="var(--color-hermes-text-secondary)" />
+                          {showChildPhase ? (
+                            <span title={childPhase.tooltip} style={{ fontWeight: 600, color: childPhaseColor, minWidth: 42, fontVariantNumeric: "tabular-nums" }}>
+                              ⏱ {childPhase.human}
+                            </span>
+                          ) : (
+                            <span style={{ minWidth: 42, color: "var(--color-hermes-text-secondary)", opacity: 0.4 }}>—</span>
+                          )}
                           <IdBadge id={child.id} variant="child" />
-                          <span style={{ fontWeight: 500, fontSize: 13 }} dangerouslySetInnerHTML={{ __html: childTitleHl.highlighted }} />
+                          <span style={{ flex: 1 }} />
+                          <span
+                            title={childIsEmergency ? "🚨 NOTFALL" : `Prio: ${childP} (${prioColor(childP).label})`}
+                            style={{
+                              fontSize: 12, fontWeight: 700, padding: "1px 6px", borderRadius: 3,
+                              background: childPrioInfo.bg, color: childPrioInfo.fg,
+                              animation: childIsEmergency ? "pulse-emergency 1.5s ease-in-out infinite" : undefined,
+                              boxShadow: childIsEmergency ? "0 0 6px rgba(248,81,73,0.5)" : undefined,
+                            }}
+                          >
+                            {childIsEmergency ? "🚨" : "🔥"} {childP}
+                          </span>
+                        </div>
+                        {/* BODY: Title volle Breite, fett, Truncation + ↳ Prefix (Hierarchie-Trennung) */}
+                        <div
+                          title={child.title}
+                          style={{
+                            fontWeight: 500,
+                            fontSize: 13,
+                            marginBottom: 3,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                          dangerouslySetInnerHTML={{ __html: "↳ " + childTitleHl.highlighted }}
+                        />
+                        {/* FOOTER: Status-Badge · Role · Level · Kosten */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>
                           <span className={`badge ${child.status === "done" ? "badge-green" : child.status === "in_progress" ? "badge-orange" : "badge-blue"}`} style={{ fontSize: 9 }}>{child.status}</span>
-                          <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>{ROLE_EMOJI[child.assigned_role] || "🤖"} {child.assigned_role}</span>
-                          {child.iteration_count > 0 && <span style={{ fontSize: 9, color: "var(--color-hermes-accent-orange)" }}>iter: {child.iteration_count}x</span>}
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>{ROLE_EMOJI[child.assigned_role] || "🤖"} {child.assigned_role}</span>
+                          <span style={{ opacity: 0.4 }}>·</span>
+                          <span title={`Hierarchie-Tiefe: ${childLevel}`} style={{ fontWeight: 500 }}>Level {childLevel}</span>
+                          {child.iteration_count > 0 && <span style={{ fontSize: 9, color: "var(--color-hermes-accent-orange)" }}>🔄 {child.iteration_count}x</span>}
+                          <span style={{ flex: 1 }} />
+                          {childCost.usd > 0 && (
+                            <span title={childCost.tooltip} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
+                              ${childCost.usd < 0.01 ? childCost.usd.toFixed(4) : childCost.usd < 1 ? childCost.usd.toFixed(3) : childCost.usd.toFixed(2)}
+                            </span>
+                          )}
                         </div>
                         <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
                           {child.success_criteria?.map((sc: string, i: number) => (
